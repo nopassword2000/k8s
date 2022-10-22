@@ -180,3 +180,10 @@ kubectl apply -f  dash.yaml
 
 生产token
 kubectl -n kubernetes-dashboard get secret $(kubectl -n kubernetes-dashboard get sa/admin-user -o jsonpath="{.secrets[0].name}") -o go-template="{{.data.token | base64decode}}"
+
+
+注意事项
+docker 必须和k8s配套否则会有意向不到的问题
+--批量删除docker
+docker stop $(docker ps -a -q)
+docker rm $(docker ps -a -q)
