@@ -1,0 +1,182 @@
+1、当前我是用的是CentOS系统，卸载操作系统自带的docker，不卸载也可以但是要求k8s一定需要和docker配套否则会失败
+yum -y remove containerd.io.x86_64 docker-ce.x86_64 docker-ce-cli.x86_64 docker-ce-rootless-extras.x86_64 docker-scan-plugin.x86_64
+2、配置yum源
+sudo yum install -y yum-utils
+sudo yum-config-manager \
+--add-repo \
+http://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+3、安装docker
+此步骤安装docker的版本决定了使用k8s的版本
+yum install -y docker-ce-19.03 docker-ce-cli-19.03  containerd.io-1.4.6
+4、设置随机启动
+systemctl enable docker --now
+5、配置docker相关环境信息
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json <<-'EOF'
+{
+  "registry-mirrors": ["https://82m9ar63.mirror.aliyuncs.com"],
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+6、准备3台centos选择一台机器为k8s集群中的master节点
+配置hosts文件，三台节点都需要配置，内容如下
+vim /etc/hosts
+192.168.74.135 node1
+7、关闭三台机器的防火墙
+a、systemctl status firewalld.service
+b、systemctl stop firewalld.service
+c、systemctl status firewalld.service
+d、systemctl disable firewalld.service
+8、其他相关设置
+# 将 SELinux 设置为 permissive 模式（相当于将其禁用）
+sudo setenforce 0
+sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+#关闭swap
+swapoff -a  
+sed -ri 's/.*swap.*/#&/' /etc/fstab
+
+#允许 iptables 检查桥接流量
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+br_netfilter
+EOF
+
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
+sudo sysctl --system
+
+9、安装k8s三大件--kubelet、kubeadm、kubectl
+配置镜像仓库
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=http://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+gpgkey=http://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg
+   http://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+exclude=kubelet kubeadm kubectl
+EOF
+安装3大件
+sudo yum install -y kubelet-1.20.9 kubeadm-1.20.9 kubectl-1.20.9 --disableexcludes=kubernetes
+设置随机启动
+sudo systemctl enable --now kubelet
+10、下载k8s其他的相关镜像组件
+sudo tee ./images.sh <<-'EOF'
+#!/bin/bash
+images=(
+kube-apiserver:v1.20.9
+kube-proxy:v1.20.9
+kube-controller-manager:v1.20.9
+kube-scheduler:v1.20.9
+coredns:1.7.0
+etcd:3.4.13-0
+pause:3.2
+)
+for imageName in ${images[@]} ; do
+docker pull registry.cn-hangzhou.aliyuncs.com/lfy_k8s_images/$imageName
+done
+EOF
+   
+chmod +x ./images.sh && ./images.sh
+
+11、使用kubeadm工具初始化集群
+kubeadm init \
+--apiserver-advertise-address=192.168.74.132 \
+--control-plane-endpoint=node1 \
+--image-repository registry.cn-hangzhou.aliyuncs.com/lfy_k8s_images \
+--kubernetes-version v1.20.9 \
+--service-cidr=10.96.0.0/16 \
+--pod-network-cidr=192.168.0.0/16
+
+初始化完成后会有如下信息
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+Alternatively, if you are the root user, you can run:
+
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+You can now join any number of control-plane nodes by copying certificate authorities
+and service account keys on each node and then running the following as root:
+
+  kubeadm join node1:6443 --token wn6yin.fbxjxd2rkxxzbn7p \
+    --discovery-token-ca-cert-hash sha256:13b073c56d10520c71596a754c171a16eeae2af7174f6797a35cc94652267d68 \
+    --control-plane 
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+kubeadm join node1:6443 --token wn6yin.fbxjxd2rkxxzbn7p \
+    --discovery-token-ca-cert-hash sha256:13b073c56d10520c71596a754c171a16eeae2af7174f6797a35cc94652267d68 
+
+执行相关命令
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+
+12、安装网络组件
+curl https://docs.projectcalico.org/v3.18/manifests/calico.yaml -O
+kubectl apply -f calico.yaml    
+
+13、在其他节点执行命令加入集群
+kubeadm join node1:6443 --token wn6yin.fbxjxd2rkxxzbn7p \
+    --discovery-token-ca-cert-hash sha256:13b073c56d10520c71596a754c171a16eeae2af7174f6797a35cc94652267d68 
+
+14、安装可视化集群dashboard
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.3.1/aio/deploy/recommended.yaml    
+也可以先把recommended.yaml下载下来 
+在执行kubectl apply -f recommended.yaml
+
+15、暴露dashboard端口
+kubectl edit svc kubernetes-dashboard -n kubernetes-dashboard
+type: ClusterIP 改为 type: NodePort
+kubectl get svc -A |grep kubernetes-dashboard
+
+https://192.168.74.132:31715/#/login 访问即可
+
+16、dashboard token生成
+#创建访问账号，准备一个yaml文件； vi dash.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kubernetes-dashboard
+
+以上内容保存到一个文件 dash.yaml
+kubectl apply -f  dash.yaml
+
+生产token
+kubectl -n kubernetes-dashboard get secret $(kubectl -n kubernetes-dashboard get sa/admin-user -o jsonpath="{.secrets[0].name}") -o go-template="{{.data.token | base64decode}}"
